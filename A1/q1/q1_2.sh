@@ -1,0 +1,7 @@
+#!/bin/bash
+
+UNIVERSAL_ITEMSET=$1
+NUM_TRANSACTIONS=$2
+
+python3 generate_dataset.py $UNIVERSAL_ITEMSET $NUM_TRANSACTIONS
+

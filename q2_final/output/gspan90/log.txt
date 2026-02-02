@@ -1,8 +1,0 @@
-scanning /home/sibgat/SJaiswal/A1/q2/output/yeast.gspan with 64110 graphs
-scanning done
-
-
--------------------System Performance------------------
-			6.41298sec
-	5  Discovered SubGraphs with at least one edge
----------------------------End-------------------------

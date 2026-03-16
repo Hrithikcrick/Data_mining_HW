@@ -1,0 +1,70 @@
+# COL761 Assignment 2
+
+This repository contains solutions for **COL761 Assignment 2 (Spring 2026)**.
+
+## Kerberos ID Used
+jtm252082
+
+---
+
+# Repository Structure
+
+A2
+├── env.sh
+├── q1
+│   ├── Q1.py
+│   ├── plot.png
+│   └── report_q1.pdf
+└── q2
+    ├── forest_fire.sh
+    ├── fireblock.py
+    └── report_q2.pdf
+
+---
+
+# Environment Setup
+
+Run:
+
+bash env.sh
+
+This installs required Python packages.
+
+---
+
+# Running Q1
+
+Dataset from API:
+
+python3 Q1.py 1
+
+or
+
+python3 Q1.py 2
+
+Local dataset:
+
+python3 Q1.py dataset.npy
+
+Output:
+- plot.png
+- optimal k printed to stdout
+
+---
+
+# Running Q2
+
+bash forest_fire.sh <graph> <seedset> <output_file> <k> <r> <hops>
+
+Example:
+
+bash forest_fire.sh dataset1/dataset_1.txt dataset1/seedset_1.txt out.txt 50 50 -1
+
+The output file contains exactly **k blocked edges**.
+
+---
+
+# Reports
+
+- `q1/report_q1.pdf` — clustering analysis
+- `q2/report_q2.pdf` — route blocking formulation and algorithm

@@ -3,41 +3,31 @@ import numpy as np
 import faiss
 
 # ------------------------------------------------------------
-# Budget-aware Q1 solver
+# Q1 solver
 #
 # D2 (<=25s):
-#   cosine + IVFPQ + evenly spaced query sampling
+#   cosine + IVFFlat + full-query voting
 # D1 (>25s):
-#   exact L2 if cheap, else HNSW-L2 with full voting
+#   exact L2 if cheap, else HNSW-L2 + full-query voting
 #
-# Designed to preserve the required solve(...) interface while
-# reducing D2 runtime substantially.
+# This removes the D2 query-sampling loss you were seeing.
 # ------------------------------------------------------------
 
 MAX_THREADS = 8
-SEED = 42
 
-# ---------- D2 / fast ----------
-D2_SAMPLE_Q1 = 32768
-D2_SAMPLE_Q2 = 16384
-D2_W1 = 0.70
-D2_W2 = 0.30
-D2_NPROBE = 12
-D2_BATCH_SIZE = 8192
+# ---------- D2 ----------
+D2_BATCH_SIZE = 16384
+D2_NPROBE = 24
 D2_EXACT_PAIR_THRESHOLD = 12_000_000
-D2_MIN_TRAIN = 25000
-D2_TRAIN_MULT = 20
+D2_MIN_TRAIN = 81920
+D2_TRAIN_MULT = 40
 
-# ---------- D1 / slow ----------
+# ---------- D1 ----------
 D1_BATCH_SIZE = 16384
 D1_HNSW_M = 24
 D1_EF_CONSTRUCTION = 48
 D1_EF_SEARCH = 256
 D1_EXACT_COST_THRESHOLD = 600_000_000
-
-# ---------- shared ----------
-MIN_TRAIN = 50000
-TRAIN_MULT = 40
 
 
 def _to_float32_contiguous(x):
@@ -64,13 +54,10 @@ def _set_num_threads():
         pass
 
 
-def _sample_even(n, s, offset=0.0):
+def _sample_even(n, s):
     if s >= n:
         return np.arange(n, dtype=np.int64)
-    pos = (np.arange(s, dtype=np.float64) + offset) * (n / float(s))
-    ids = np.floor(pos).astype(np.int64)
-    np.clip(ids, 0, n - 1, out=ids)
-    return ids
+    return np.linspace(0, n - 1, num=s, dtype=np.int64)
 
 
 def _pick_nlist(n):
@@ -84,17 +71,6 @@ def _pick_nlist(n):
         return 2048
     else:
         return 4096
-
-
-def _pick_pq_m(d):
-    preferred = [64, 56, 48, 40, 32, 28, 24, 20, 16, 14, 12, 10, 8, 7, 6, 5, 4, 3, 2, 1]
-    for m in preferred:
-        if m <= d and d % m == 0:
-            return m
-    for m in range(min(64, d), 0, -1):
-        if d % m == 0:
-            return m
-    return 1
 
 
 def _exact_search_l2(base, queries, k, K):
@@ -131,16 +107,16 @@ def _exact_search_cosine(base, queries, k, K):
     return order[:K]
 
 
-def _build_ivfpq_cosine(base):
+def _build_ivf_cosine(base):
     n, d = base.shape
     nlist = _pick_nlist(n)
-    m = _pick_pq_m(d)
 
     quantizer = faiss.IndexFlatIP(d)
-    index = faiss.IndexIVFPQ(quantizer, d, nlist, m, 8, faiss.METRIC_INNER_PRODUCT)
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
 
     train_size = min(n, max(D2_MIN_TRAIN, nlist * D2_TRAIN_MULT))
     train_idx = _sample_even(n, train_size)
+
     index.train(base[train_idx])
     index.add(base)
     index.nprobe = min(nlist, D2_NPROBE)
@@ -156,7 +132,7 @@ def _build_hnsw_l2(base):
     return index
 
 
-def _weighted_vote_from_index(index, queries, k, n_base, batch_size, weight_per_query):
+def _vote_from_index(index, queries, k, n_base, batch_size):
     counts = np.zeros(n_base, dtype=np.float64)
     bonus = np.zeros(n_base, dtype=np.float64)
     rank_bonus = np.arange(k, 0, -1, dtype=np.float64)
@@ -170,20 +146,16 @@ def _weighted_vote_from_index(index, queries, k, n_base, batch_size, weight_per_
             continue
 
         flat_ids = neigh[valid]
-        counts += np.bincount(flat_ids, weights=np.full(flat_ids.shape[0], weight_per_query), minlength=n_base)
+        counts += np.bincount(flat_ids, minlength=n_base)
 
         rb = np.broadcast_to(rank_bonus, neigh.shape)
-        bonus += np.bincount(flat_ids, weights=rb[valid] * weight_per_query, minlength=n_base)
+        bonus += np.bincount(flat_ids, weights=rb[valid], minlength=n_base)
 
     return counts, bonus
 
 
-def _combine_scores(counts, bonus):
-    return counts * 1000.0 + bonus
-
-
-def _rank_from_scores(scores, K):
-    order = np.lexsort((np.arange(scores.shape[0]), -scores))
+def _rank_from_counts_bonus(counts, bonus, K):
+    order = np.lexsort((np.arange(counts.shape[0]), -bonus, -counts))
     return order[:K]
 
 
@@ -197,38 +169,9 @@ def _solve_d2(base, queries, k, K):
     if n_base * n_queries <= D2_EXACT_PAIR_THRESHOLD:
         return _exact_search_cosine(base, queries, k, K)
 
-    index = _build_ivfpq_cosine(base)
-
-    s1 = min(n_queries, D2_SAMPLE_Q1)
-    ids1 = _sample_even(n_queries, s1, offset=0.0)
-    q1 = queries[ids1]
-    w1 = D2_W1 * n_queries / float(s1)
-
-    counts1, bonus1 = _weighted_vote_from_index(
-        index=index,
-        queries=q1,
-        k=k,
-        n_base=n_base,
-        batch_size=D2_BATCH_SIZE,
-        weight_per_query=w1,
-    )
-
-    s2 = min(n_queries, D2_SAMPLE_Q2)
-    ids2 = _sample_even(n_queries, s2, offset=0.5)
-    q2 = queries[ids2]
-    w2 = D2_W2 * n_queries / float(s2)
-
-    counts2, bonus2 = _weighted_vote_from_index(
-        index=index,
-        queries=q2,
-        k=k,
-        n_base=n_base,
-        batch_size=D2_BATCH_SIZE,
-        weight_per_query=w2,
-    )
-
-    scores = _combine_scores(counts1 + counts2, bonus1 + bonus2)
-    return _rank_from_scores(scores, K)
+    index = _build_ivf_cosine(base)
+    counts, bonus = _vote_from_index(index, queries, k, n_base, D2_BATCH_SIZE)
+    return _rank_from_counts_bonus(counts, bonus, K)
 
 
 def _solve_d1(base, queries, k, K):
@@ -240,18 +183,8 @@ def _solve_d1(base, queries, k, K):
         return _exact_search_l2(base, queries, k, K)
 
     index = _build_hnsw_l2(base)
-
-    counts, bonus = _weighted_vote_from_index(
-        index=index,
-        queries=queries,
-        k=k,
-        n_base=n_base,
-        batch_size=D1_BATCH_SIZE,
-        weight_per_query=1.0,
-    )
-
-    scores = _combine_scores(counts, bonus)
-    return _rank_from_scores(scores, K)
+    counts, bonus = _vote_from_index(index, queries, k, n_base, D1_BATCH_SIZE)
+    return _rank_from_counts_bonus(counts, bonus, K)
 
 
 def solve(base_vectors, query_vectors, k, K, time_budget):
